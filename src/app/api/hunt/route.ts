@@ -25,8 +25,7 @@ async function callLLM(cfg: LLMConfig, system: string, user: string): Promise<st
       },
       body: JSON.stringify({
         model: process.env.GROQ_MODEL || "openai/gpt-oss-120b",
-        temperature: 0.8,
-        response_format: { type: "json_object" },
+        temperature: 0.7,
         messages: [
           { role: "system", content: system },
           { role: "user", content: user },
@@ -50,7 +49,7 @@ async function callLLM(cfg: LLMConfig, system: string, user: string): Promise<st
     body: JSON.stringify({
       model: process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6",
       max_tokens: 4096,
-      temperature: 0.8,
+      temperature: 0.7,
       system,
       messages: [{ role: "user", content: user }],
     }),
@@ -69,7 +68,13 @@ function parseJSON<T>(text: string): T {
   if (start < 0 || end < 0 || end < start) {
     throw new Error("The AI did not return valid JSON. Please try again.");
   }
-  return JSON.parse(text.slice(start, end + 1)) as T;
+  try {
+    return JSON.parse(text.slice(start, end + 1)) as T;
+  } catch {
+    // Fallback cleanup for common trailing commas or minor JSON flaws
+    const cleaned = text.slice(start, end + 1).replace(/,\s*([\]}])/g, "$1");
+    return JSON.parse(cleaned) as T;
+  }
 }
 
 /* ------------------------------ Serper.dev ------------------------------- */
@@ -83,7 +88,7 @@ async function serperSearch(query: string, key: string): Promise<SerperResult[]>
   const res = await fetch("https://google.serper.dev/search", {
     method: "POST",
     headers: { "X-API-KEY": key, "Content-Type": "application/json" },
-    body: JSON.stringify({ q: query, num: 8, tbs: "qdr:m" }),
+    body: JSON.stringify({ q: query, num: 6, tbs: "qdr:m" }),
   });
   if (!res.ok) {
     throw new Error(`Serper.dev error ${res.status}: ${(await res.text()).slice(0, 200)}`);
@@ -125,7 +130,7 @@ async function dnsStatus(domain: string): Promise<Status> {
   try {
     const res = await timedFetch(`https://dns.google/resolve?name=${domain}&type=NS`);
     const json = await res.json();
-    if (json.Status === 3) return "free"; // NXDOMAIN
+    if (json.Status === 3) return "free";
     if (Array.isArray(json.Answer) && json.Answer.length > 0) return "taken";
     return "unknown";
   } catch {
@@ -154,20 +159,9 @@ async function filterAvailable(domains: string[]): Promise<{ available: string[]
 
 /* -------------------------------- Prompts -------------------------------- */
 
-const SNIPER_SYSTEM = `You are an elite domain investor following a strict "Sniper Portfolio Strategy": only 3 to 5 category-killer domains, never a bloated portfolio.
+const SNIPER_SYSTEM = `You are an elite domain investor. Return ONLY valid JSON, no markdown formatting, no explanations. Format: {"candidates":[{"domain":"example.com","reason":"short"}]}`;
 
-Every domain you suggest MUST pass ALL of these filters:
-1. Exactly 1 or 2 real dictionary words, OR one punchy 5-8 letter brandable word.
-2. No hyphens, no numbers.
-3. Passes the "Radio Test": easy to spell when heard out loud.
-4. High commercial intent: a funded B2B startup, SaaS, fintech, AI-agent or green-tech company would pay $1,500 to $10,000+ for it.
-5. Extension is .com. Use .ai ONLY if the name is strictly AI-related.
-
-Respond with JSON only, no prose and no markdown.`;
-
-const VALUATION_SYSTEM = `You are an elite domain appraiser and aftermarket broker (Afternic, Sedo, Sav, NameBio). You value domains conservatively and realistically for end-user sales to funded companies. Never invent specific sale records: describe comparable-sale patterns in general terms (keyword type, length, TLD, typical price band) rather than citing made-up transactions.
-
-Respond with JSON only, no prose and no markdown.`;
+const VALUATION_SYSTEM = `You are an elite domain appraiser. Return ONLY valid JSON, no markdown formatting. Format: {"deals":[{"domain":"example.com","sniperScore":85,"whyValuable":"text","targetBuyers":["SaaS"],"comparableSales":"text","afternicPricing":{"bin":1950,"floor":900,"minOffer":700},"marketplaceCopy":{"category":"Tech","description":"line1\nline2\nline3"}}]}`;
 
 /* -------------------------------- Helpers -------------------------------- */
 
@@ -253,54 +247,40 @@ export async function POST(req: NextRequest) {
         const providerLabel = provider === "groq" ? "Groq (openai/gpt-oss-120b)" : "Anthropic Claude";
         const year = new Date().getFullYear();
 
-        /* Step 1: live research */
         log(`Step 1: Scouring live market trends via Serper.dev${niche ? ` for "${niche}"` : ""}...`);
         const queries = niche
-          ? [
-              `${niche} startups raised funding this month`,
-              `${niche} emerging buzzwords trends ${year}`,
-              `domain name sales NameBio Afternic ${niche} ${year}`,
-            ]
-          : [
-              `startups raised seed series A funding this week B2B SaaS AI fintech`,
-              `emerging tech buzzwords trends ${year}`,
-              `domain name sales NameBio Afternic ${year} .com`,
-            ];
+          ? [`${niche} startups funding trends ${year}`, `${niche} domain name sales Afternic ${year}`]
+          : [`startups raised funding seed series A ${year}`, `domain name sales Afternic ${year} .com`];
+
         const searchResults = await Promise.all(queries.map((q) => serperSearch(q, serperKey).catch(() => [])));
         const snippets = searchResults
           .flat()
           .map((r) => `- ${r.title ?? ""}: ${r.snippet ?? ""}`)
           .filter((s) => s.length > 6)
-          .slice(0, 30)
+          .slice(0, 15)
           .join("\n");
         if (!snippets) throw new Error("Serper.dev returned no results. Check your Serper API key and quota.");
         log(`Collected ${snippets.split("\n").length} live market snippets.`, "success");
 
-        /* Steps 2 and 3: generate and verify (up to 2 rounds) */
         let generatedTotal = 0;
         const seen = new Set<string>();
         const available: string[] = [];
 
-        for (let round = 1; round <= 2 && available.length < 6; round++) {
-          log(`Step 2: Generating Sniper candidates with ${providerLabel}${round > 1 ? " (second round)" : ""}...`);
-          const avoid = Array.from(seen).slice(0, 60).join(", ");
-          const userPrompt = `Today's live market research (Google results):\n${snippets}\n\n${
-            niche ? `Focus niche: ${niche}` : "Focus: auto-discover the hottest funded B2B niches from the research above."
-          }\n\nGenerate 20 sniper domain candidates.${
-            avoid ? `\nDo NOT repeat any of these: ${avoid}` : ""
-          }\n\nReturn JSON exactly like: {"candidates":[{"domain":"example.com","reason":"short reason"}]}`;
+        // Single optimized round to prevent token rate limits on free tier
+        log(`Step 2: Generating Sniper candidates with ${providerLabel}...`);
+        const userPrompt = `Market research:\n${snippets}\n\nNiche: ${niche || "B2B SaaS AI"}\n\nGenerate 15 short brandable .com domain candidates (1-2 words, max 10 letters, no hyphens/numbers). Return ONLY raw JSON: {"candidates":[{"domain":"example.com","reason":"short"}]}`;
 
-          const text = await callLLM(cfg, SNIPER_SYSTEM, userPrompt);
-          const parsed = parseJSON<{ candidates?: { domain?: unknown }[] }>(text);
-          const candidates = (parsed.candidates || [])
-            .map((c) => normalizeDomain(c?.domain))
-            .filter((d): d is string => !!d && !seen.has(d));
-          const unique = Array.from(new Set(candidates));
-          unique.forEach((d) => seen.add(d));
-          generatedTotal += unique.length;
-          log(`Generated ${unique.length} valid candidates.`, "success");
-          if (unique.length === 0) continue;
+        const text = await callLLM(cfg, SNIPER_SYSTEM, userPrompt);
+        const parsed = parseJSON<{ candidates?: { domain?: unknown }[] }>(text);
+        const candidates = (parsed.candidates || [])
+          .map((c) => normalizeDomain(c?.domain))
+          .filter((d): d is string => !!d && !seen.has(d));
+        const unique = Array.from(new Set(candidates));
+        unique.forEach((d) => seen.add(d));
+        generatedTotal += unique.length;
+        log(`Generated ${unique.length} valid candidates.`, "success");
 
+        if (unique.length > 0) {
           log(`Step 3: Verifying live RDAP/DNS availability for ${unique.length} domains...`);
           const result = await filterAvailable(unique);
           available.push(...result.available);
@@ -314,17 +294,8 @@ export async function POST(req: NextRequest) {
           throw new Error("No unregistered domains were found this run. Try again or pick a different niche.");
         }
 
-        /* Step 4: valuation and Afternic pack */
         log("Step 4: Generating Afternic valuation report for the Goldmine picks...");
-        const valuationPrompt = `These domains are verified unregistered and can be hand-registered for about $10-$15:\n${available.join(
-          ", "
-        )}\n\nMarket context:\n${snippets}\n\nSelect ONLY the best 3 to 4 "Goldmine" domains (or fewer if fewer are genuinely strong). For each, return:\ndomain (exactly as given)
-- sniperScore (0-100)
-- whyValuable (3-5 sentences on commercial intent, brandability, trend alignment)
-- targetBuyers (array of specific buyer types)
-- comparableSales (2-3 sentences on aftermarket sale patterns for similar keyword/length/TLD structures; do not invent specific transactions)
-- afternicPricing: {"bin": number, "floor": number, "minOffer": number} in USD, realistic for end-user sales
-- marketplaceCopy: {"category": "Afternic/Sedo category", "description": "exactly 3 short lines separated by \n, ready to paste"}\n\nReturn JSON exactly like: {"deals":[{...}]}`;
+        const valuationPrompt = `Verified unregistered domains:\n${available.join(", ")}\n\nMarket context:\n${snippets}\n\nSelect best 3 domains. Return ONLY raw JSON: {"deals":[{"domain":"example.com","sniperScore":85,"whyValuable":"3 sentences","targetBuyers":["SaaS"],"comparableSales":"2 sentences","afternicPricing":{"bin":1950,"floor":900,"minOffer":700},"marketplaceCopy":{"category":"Tech","description":"line1\nline2\nline3"}}]}`;
 
         const valuationText = await callLLM(cfg, VALUATION_SYSTEM, valuationPrompt);
         const valuation = parseJSON<{ deals?: RawDeal[] }>(valuationText);
@@ -335,7 +306,7 @@ export async function POST(req: NextRequest) {
           if (domain && availableSet.has(domain) && !deals.some((d) => d.domain === domain)) {
             deals.push(cleanDeal(raw, domain));
           }
-          if (deals.length >= 4) break;
+          if (deals.length >= 3) break;
         }
         if (deals.length === 0) throw new Error("The AI returned no usable valuation. Please try again.");
         deals.sort((a, b) => b.sniperScore - a.sniperScore);
