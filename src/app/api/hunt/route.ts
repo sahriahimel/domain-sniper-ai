@@ -24,7 +24,7 @@ async function callLLM(cfg: LLMConfig, system: string, user: string): Promise<st
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: process.env.GROQ_MODEL || "llama-3.3-70b-versatile",
+        model: process.env.GROQ_MODEL || "openai/gpt-oss-120b",
         temperature: 0.8,
         response_format: { type: "json_object" },
         messages: [
@@ -250,7 +250,7 @@ export async function POST(req: NextRequest) {
         if (provider === "anthropic" && !anthropicKey) throw new Error("Missing Anthropic API key. Add it in Settings.");
 
         const cfg: LLMConfig = { provider, groqKey, anthropicKey };
-        const providerLabel = provider === "groq" ? "Groq (llama-3.3-70b)" : "Anthropic Claude";
+        const providerLabel = provider === "groq" ? "Groq (openai/gpt-oss-120b)" : "Anthropic Claude";
         const year = new Date().getFullYear();
 
         /* Step 1: live research */
@@ -318,7 +318,13 @@ export async function POST(req: NextRequest) {
         log("Step 4: Generating Afternic valuation report for the Goldmine picks...");
         const valuationPrompt = `These domains are verified unregistered and can be hand-registered for about $10-$15:\n${available.join(
           ", "
-        )}\n\nMarket context:\n${snippets}\n\nSelect ONLY the best 3 to 4 "Goldmine" domains (or fewer if fewer are genuinely strong). For each, return:\n- domain (exactly as given)\n- sniperScore (0-100)\n- whyValuable (3-5 sentences on commercial intent, brandability, trend alignment)\n- targetBuyers (array of specific buyer types)\n- comparableSales (2-3 sentences on aftermarket sale patterns for similar keyword/length/TLD structures; do not invent specific transactions)\n- afternicPricing: {"bin": number, "floor": number, "minOffer": number} in USD, realistic for end-user sales\n- marketplaceCopy: {"category": "Afternic/Sedo category", "description": "exactly 3 short lines separated by \\n, ready to paste"}\n\nReturn JSON exactly like: {"deals":[{...}]}`;
+        )}\n\nMarket context:\n${snippets}\n\nSelect ONLY the best 3 to 4 "Goldmine" domains (or fewer if fewer are genuinely strong). For each, return:\ndomain (exactly as given)
+- sniperScore (0-100)
+- whyValuable (3-5 sentences on commercial intent, brandability, trend alignment)
+- targetBuyers (array of specific buyer types)
+- comparableSales (2-3 sentences on aftermarket sale patterns for similar keyword/length/TLD structures; do not invent specific transactions)
+- afternicPricing: {"bin": number, "floor": number, "minOffer": number} in USD, realistic for end-user sales
+- marketplaceCopy: {"category": "Afternic/Sedo category", "description": "exactly 3 short lines separated by \n, ready to paste"}\n\nReturn JSON exactly like: {"deals":[{...}]}`;
 
         const valuationText = await callLLM(cfg, VALUATION_SYSTEM, valuationPrompt);
         const valuation = parseJSON<{ deals?: RawDeal[] }>(valuationText);
